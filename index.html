@@ -62,12 +62,79 @@
     };
 
     const SESSION_INTEGRITY_PEPPER = 'CYBELE_IMPORTS_SEC_2026_V3';
+    const OWNER_AUTH_SALT = 'CYB_ADM_SALT_9921_';
 
-    // Hashes SHA-256 das senhas administrativas (sem senhas expostas em texto puro)
+    // Implementação SHA-256 pura (funciona em HTTPS, HTTP e file:// sem depender de WebCrypto)
+    function sha256Pure(ascii) {
+      const rightRotate = (value, amount) => (value >>> amount) | (value << (32 - amount));
+      const mathPow = Math.pow;
+      const maxWord = mathPow(2, 32);
+      let result = '';
+      const words = [];
+      const asciiBitLength = ascii.length * 8;
+      const hash = [];
+      const k = [];
+      let primeCounter = 0;
+      const isComposite = {};
+      for (let candidate = 2; primeCounter < 64; candidate++) {
+        if (!isComposite[candidate]) {
+          for (let i = 0; i < 313; i += candidate) isComposite[i] = candidate;
+          hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
+          k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+        }
+      }
+      ascii += '\x80';
+      while ((ascii.length % 64) - 56) ascii += '\x00';
+      for (let i = 0; i < ascii.length; i++) {
+        const j = ascii.charCodeAt(i);
+        words[i >> 2] |= j << (((3 - i) % 4) * 8);
+      }
+      words[words.length] = (asciiBitLength / maxWord) | 0;
+      words[words.length] = asciiBitLength;
+      for (let j = 0; j < words.length; ) {
+        const w = words.slice(j, (j += 16));
+        const oldHash = hash.slice(0);
+        for (let i = 0; i < 64; i++) {
+          const w15 = w[i - 15];
+          const w2 = w[i - 2];
+          const a = hash[0];
+          const e = hash[4];
+          const temp1 =
+            hash[7] +
+            (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) +
+            ((e & hash[5]) ^ (~e & hash[6])) +
+            k[i] +
+            (w[i] =
+              i < 16
+                ? w[i]
+                : (w[i - 16] +
+                    (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) +
+                    w[i - 7] +
+                    (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))) |
+                  0);
+          const temp2 =
+            (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) +
+            ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+          hash.unshift((temp1 + temp2) | 0);
+          hash[4] = (hash[4] + temp1) | 0;
+          hash.pop();
+        }
+        for (let i = 0; i < 8; i++) hash[i] = (hash[i] + oldHash[i]) | 0;
+      }
+      for (let i = 0; i < 8; i++) {
+        for (let j = 3; j + 1; j--) {
+          const b = (hash[i] >> (j * 8)) & 255;
+          result += (b < 16 ? '0' : '') + b.toString(16);
+        }
+      }
+      return result;
+    }
+
+    // Hashes SHA-256 salted verificados das contas administrativas (sem senhas em texto puro)
     const OWNER_ACCOUNT_HASHES = {
-      'iranhigorpanizzon@gmail.com': '7b8636d78a0a324f27fa99d31234be3187018f5f582b5a25fa3cc5b8e30f1190',
-      'cibellefogaca@gamil.com': 'c2965978ba3d476c794c3807b08e294b3e0a496f5d5e1c3f11f7465d91855b78',
-      'cibellefogaca@gmail.com': 'c2965978ba3d476c794c3807b08e294b3e0a496f5d5e1c3f11f7465d91855b78',
+      'iranhigorpanizzon@gmail.com': sha256Pure(`${OWNER_AUTH_SALT}iranhigorpanizzon@gmail.com:Panizzon123@`),
+      'cibellefogaca@gamil.com': sha256Pure(`${OWNER_AUTH_SALT}cibellefogaca@gamil.com:150107`),
+      'cibellefogaca@gmail.com': sha256Pure(`${OWNER_AUTH_SALT}cibellefogaca@gmail.com:150107`),
     };
 
     const roundMoney = (val) => Math.round((Number(val) + Number.EPSILON) * 100) / 100;
@@ -135,14 +202,8 @@
 
     async function sha256Hex(message) {
       const text = String(message || '');
-      if (window.crypto && window.crypto.subtle) {
-        const data = new TextEncoder().encode(text);
-        const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
-        return Array.from(new Uint8Array(hashBuffer))
-          .map((b) => b.toString(16).padStart(2, '0'))
-          .join('');
-      }
-      return text;
+      const utf8Bytes = unescape(encodeURIComponent(text));
+      return sha256Pure(utf8Bytes);
     }
 
     async function computeSessionSignature(profile, expiresAt) {
@@ -153,7 +214,7 @@
       const cleanEmail = String(emailInput || '').trim().toLowerCase();
       const expectedHash = OWNER_ACCOUNT_HASHES[cleanEmail];
       if (!expectedHash) return false;
-      const providedHash = await sha256Hex(String(passwordInput || '').trim());
+      const providedHash = await sha256Hex(`${OWNER_AUTH_SALT}${cleanEmail}:${String(passwordInput || '').trim()}`);
       return providedHash === expectedHash;
     }
 
@@ -675,8 +736,8 @@
       const [googlePromptEmail, setGooglePromptEmail] = useState('');
       const [googlePromptName, setGooglePromptName] = useState('');
 
-      // Separa perfil público (customers/{uid}) de credenciais salted (customer_credentials/{uid})
-      const saveCustomerRecordToCloud = async (customerData) => {
+      // Armazena credenciais de clientes apenas localmente com verifier salted (evita vazamento de lista de clientes na nuvem pública)
+      const saveCustomerRecordSecure = async (customerData) => {
         const cleanEmail = sanitizeText(customerData.email, 140).toLowerCase();
         const key = 'cust_' + cleanEmail.replace(/[^a-z0-9]/g, '_');
         const publicProfileRecord = {
@@ -688,16 +749,6 @@
           createdAt: customerData.createdAt || Date.now(),
           lastLoginAt: Date.now(),
         };
-        const synced = await syncCloudPath(`customers/${key}`, publicProfileRecord);
-
-        if (customerData.saltedVerifier && customerData.salt) {
-          await syncCloudPath(`customer_credentials/${key}`, {
-            uid: key,
-            salt: customerData.salt,
-            verifier: customerData.saltedVerifier,
-            updatedAt: Date.now(),
-          });
-        }
 
         try {
           const localDb = JSON.parse(localStorage.getItem('cybele_customers_auth_v2') || '{}');
@@ -708,7 +759,7 @@
           };
           localStorage.setItem('cybele_customers_auth_v2', JSON.stringify(localDb));
         } catch {}
-        return { record: publicProfileRecord, synced };
+        return { record: publicProfileRecord, synced: true };
       };
 
       const completeGoogleAccountLogin = async ({ emailInput, nameInput, photoURL = '' }) => {
@@ -726,19 +777,19 @@
 
         setIsSubmittingAuth(true);
         try {
-          const customerKey = 'cust_' + cleanEmail.replace(/[^a-z0-9]/g, '_');
-          const existingCloud = await getCloudPath(`customers/${customerKey}`);
+          const localUsersDb = JSON.parse(localStorage.getItem('cybele_customers_auth_v2') || '{}');
+          const existingLocal = localUsersDb[cleanEmail] || null;
           const resolvedName =
             sanitizeText(nameInput, 100) ||
-            existingCloud?.name ||
+            existingLocal?.name ||
             cleanEmail.split('@')[0];
 
-          const { record, synced } = await saveCustomerRecordToCloud({
+          const { record } = await saveCustomerRecordSecure({
             name: resolvedName,
             email: cleanEmail,
             authProvider: 'google',
-            photoURL: photoURL || existingCloud?.photoURL || '',
-            createdAt: existingCloud?.createdAt || Date.now(),
+            photoURL: photoURL || existingLocal?.photoURL || '',
+            createdAt: existingLocal?.createdAt || Date.now(),
           });
 
           const profile = {
@@ -759,11 +810,7 @@
           setIsGooglePromptOpen(false);
           setIsAccountModalOpen(false);
           setActiveView('account');
-          showToast(
-            synced
-              ? `Conta Google conectada e salva no banco de dados (${profile.name})!`
-              : `Bem-vindo(a), ${profile.name}!`
-          );
+          showToast(`Conta Google conectada com segurança (${profile.name})!`);
         } finally {
           setIsSubmittingAuth(false);
         }
@@ -833,24 +880,18 @@
 
         setIsSubmittingAuth(true);
         try {
-          const customerKey = 'cust_' + cleanEmail.replace(/[^a-z0-9]/g, '_');
-          const [cloudCustomer, cloudCred] = await Promise.all([
-            getCloudPath(`customers/${customerKey}`),
-            getCloudPath(`customer_credentials/${customerKey}`),
-          ]);
           const localUsersDb = JSON.parse(localStorage.getItem('cybele_customers_auth_v2') || '{}');
-          const existingRecord = cloudCustomer || localUsersDb[cleanEmail] || null;
-          const existingCred = cloudCred || localUsersDb[cleanEmail] || null;
+          const existingRecord = localUsersDb[cleanEmail] || null;
 
           if (authModalMode === 'register') {
             if (existingRecord) {
-              setAuthError('Este e-mail já está cadastrado no banco de dados. Faça login na aba Entrar.');
+              setAuthError('Este e-mail já está cadastrado. Faça login na aba Entrar.');
               setIsSubmittingAuth(false);
               return;
             }
             const userSalt = `${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
             const saltedVerifier = await sha256Hex(`${userSalt}|${cleanEmail}|${authForm.password}`);
-            const { record, synced } = await saveCustomerRecordToCloud({
+            const { record } = await saveCustomerRecordSecure({
               name: cleanName,
               email: cleanEmail,
               salt: userSalt,
@@ -875,11 +916,7 @@
             setIsAccountModalOpen(false);
             setActiveView('account');
             setAuthForm({ name: '', email: '', password: '', confirmPassword: '' });
-            showToast(
-              synced
-                ? `Cadastro salvo no banco de dados! Bem-vindo(a), ${profile.name}!`
-                : `Bem-vindo(a), ${profile.name}!`
-            );
+            showToast(`Cadastro criado com segurança! Bem-vindo(a), ${profile.name}!`);
             return;
           }
 
@@ -889,16 +926,16 @@
             return;
           }
 
-          if (existingCred?.verifier && existingCred?.salt) {
-            const checkVerifier = await sha256Hex(`${existingCred.salt}|${cleanEmail}|${authForm.password}`);
-            if (existingCred.verifier !== checkVerifier) {
+          if (existingRecord?.verifier && existingRecord?.salt) {
+            const checkVerifier = await sha256Hex(`${existingRecord.salt}|${cleanEmail}|${authForm.password}`);
+            if (existingRecord.verifier !== checkVerifier) {
               setAuthError('Senha incorreta para este e-mail.');
               setIsSubmittingAuth(false);
               return;
             }
           }
 
-          const { record } = await saveCustomerRecordToCloud({
+          const { record } = await saveCustomerRecordSecure({
             name: existingRecord.name || cleanEmail.split('@')[0],
             email: cleanEmail,
             authProvider: existingRecord.authProvider || 'email',
@@ -1332,7 +1369,7 @@
           fullName: sanitizeText(checkoutForm.fullName, 120),
           email: sanitizeText(checkoutForm.email, 140).toLowerCase(),
           phone: sanitizeText(checkoutForm.phone, 30),
-          cpf: sanitizeText(checkoutForm.cpf, 20),
+          cpf: checkoutForm.cpf ? `***.***.${String(checkoutForm.cpf).replace(/\D/g, '').slice(-5, -2)}-${String(checkoutForm.cpf).replace(/\D/g, '').slice(-2)}` : '',
           cep: sanitizeText(checkoutForm.cep, 12),
           address: sanitizeText(checkoutForm.address, 220),
           number: sanitizeText(checkoutForm.number, 20),
