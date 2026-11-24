@@ -1267,7 +1267,10 @@
                 ].filter(Boolean).join('\n');
 
           const bodyText = `Olá, ${adminRecipient.name}!\nSegue abaixo a etiqueta com os dados completos para postagem/separação:\n\n${shippingLabelBlock}`;
-          let deliveryState = 'Pronto para envio (Webhook/Resend/EmailJS)';
+          let deliveryState = 'Enviado por E-mail';
+          let delivered = false;
+
+          // 1. Tentativa via Webhook personalizado (se configurado no painel)
           const safeWebhook = sanitizeMediaUrl(emailWebhookUrl, true);
           if (safeWebhook) {
             try {
@@ -1276,9 +1279,48 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ to: adminRecipient.email, recipientName: adminRecipient.name, subject, text: bodyText, order, eventType, dateTime: formattedDateTime }),
               });
-              deliveryState = res.ok ? 'Enviado via Webhook' : 'Pendente (Falha no Webhook)';
+              if (res.ok) {
+                deliveryState = 'Enviado via Webhook';
+                delivered = true;
+              }
+            } catch {}
+          }
+
+          // 2. Envio direto automático para a caixa de entrada do administrador via FormSubmit AJAX
+          if (!delivered) {
+            try {
+              const fsRes = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(adminRecipient.email)}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json',
+                },
+                body: JSON.stringify({
+                  _subject: subject,
+                  _template: 'table',
+                  _captcha: 'false',
+                  Pedido: order.orderNumber,
+                  Evento: eventType === 'PAYMENT_APPROVED' ? 'PAGAMENTO CONFIRMADO' : 'NOVO PEDIDO RECEBIDO',
+                  Cliente: order.customer.fullName,
+                  WhatsApp_Cliente: order.customer.phone,
+                  Email_Cliente: order.customer.email,
+                  Modalidade: order.deliveryMethod === 'pickup' ? 'Retirada na Loja Física' : 'Entrega com Frete',
+                  Endereco_Entrega: formattedAddress,
+                  Itens_Comprados: order.items.map((i) => `${i.quantity}x ${i.name} (${formatCurrency(i.total)})`).join(' | '),
+                  Valor_Total: formatCurrency(order.total),
+                  Forma_Pagamento: `${paymentLabel} (${statusLabel || order.paymentStatus})`,
+                  Etiqueta_Completa: shippingLabelBlock,
+                  Data_Hora: formattedDateTime,
+                }),
+              });
+              if (fsRes.ok) {
+                deliveryState = 'Enviado para caixa de entrada';
+                delivered = true;
+              } else {
+                deliveryState = 'Pendente (Ativar e-mail na 1ª venda)';
+              }
             } catch {
-              deliveryState = 'Pendente (Erro de conexão Webhook)';
+              deliveryState = 'Pendente (Verifique conexão ou use botão Enviar)';
             }
           }
 
